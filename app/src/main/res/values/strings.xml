@@ -1,0 +1,4 @@
+<resources>
+  <string name="app_name">B站直播隐身观看</string>
+  <string name="xposed_description">B站直播间低调看播,无迹可寻:隐藏进场特效与欢迎消息、匿名心跳不占在线、黑名单/白名单、直播间悬浮实时开关;弹幕连接保持登录态,昵称不再被打码。</string>
+</resources>

@@ -1,0 +1,84 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+// 发布签名: 存在 keystore.properties 时使用正式签名, 否则回退 debug 签名。
+// keystore.properties 不入库, 由本地或 CI (GitHub Actions secrets) 提供。
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
+android {
+    namespace 'io.github.ruix156.bilivestealth'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "io.github.ruix156.bilivestealth"
+        minSdk 28
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    packaging {
+        resources {
+            merges += "META-INF/xposed/*"
+        }
+    }
+}
+
+// 构建完成后将 APK 重命名为 BiLiveStealth_v<versionName>.apk
+tasks.whenTaskAdded { task ->
+    if (task.name.startsWith("package") && !task.name.contains("Resources")) {
+        task.doLast {
+            def outputDir = task.outputDirectory.getAsFile().get()
+            def vName = android.defaultConfig.versionName
+
+            outputDir.eachFileMatch(~/.*\.apk/) { file ->
+                def newName = "BiLiveStealth_v${vName}.apk"
+                def renamedFile = new File(file.parent, newName)
+                if (file.exists() && file.name != newName) {
+                    file.renameTo(renamedFile)
+                    println "====== APK 重命名成功: ${renamedFile.name} ======"
+                }
+            }
+        }
+    }
+}
+
+dependencies {
+    compileOnly libs.libxposed.api
+    implementation libs.dexkit
+    // dexkit 的 POM 未声明 kotlin-stdlib, 需要显式引入 (否则 singleOrNull 等方法编译报错)
+    implementation libs.kotlin.stdlib
+}
