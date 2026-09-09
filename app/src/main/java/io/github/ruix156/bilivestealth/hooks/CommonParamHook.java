@@ -7,18 +7,19 @@ import android.util.Log;
 import java.lang.reflect.Method;
 import java.util.Map;
 
+import io.github.ruix156.bilivestealth.LiveTimeFetcher;
 import io.github.ruix156.bilivestealth.MainHook;
 import io.github.ruix156.bilivestealth.Settings;
+import io.github.ruix156.bilivestealth.StealthConfig;
 
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
-import io.github.ruix156.bilivestealth.AnchorInfoFetcher;
 
 /**
  * 拦截 B 站直播公共参数组装方法 addCommonParam(Map),
  * 按设置对进场上报 / 心跳 / 弹幕服务器请求做匿名化处理。
  */
 public class CommonParamHook {
-  private static final boolean DEBUG = false;
+  private static final boolean DEBUG = true;
 
   private final MainHook mainHook;
   private final PackageReadyParam param;
@@ -53,33 +54,33 @@ public class CommonParamHook {
   private void apply(Map<String, Object> params) {
     long roomId = parseRoomId(params.get("room_id"));
     if (roomId > 0) {
-      settings.setCurrentRoom(roomId);
-      // 自主请求公开接口, 建立房间 -> 主播uid/昵称/开播时间 映射 (内部有去重节流)
-      AnchorInfoFetcher.fetchAsync(roomId, settings);
+      // 自主请求公开接口获取开播时间 (场次 key), 供 "首进可见" 判定 (内部有去重节流)
+      LiveTimeFetcher.fetchAsync(roomId, settings);
     }
     boolean stealth = settings.shouldStealth(roomId);
+    StealthConfig config = settings.configSnapshot();
 
     // 获取弹幕服务器 (getDanmuInfo): 仅 "游客弹幕连接" 开启时移除 access_key。
     // 默认保留登录态, 否则 B 站会把弹幕昵称打码为 ***
-    if (stealth && settings.guestDanmaku && params.containsKey("is_anchor")) {
+    if (stealth && config.guestDanmaku && params.containsKey("is_anchor")) {
       params.remove("access_key");
       debugLog("addCommonParam is_anchor access_key removed");
     }
 
     // 进场上报: 替换 room_id, 不触发进场特效/欢迎消息。
     // "首进可见"名单内的房间, 每场直播的首次入场保持正常, 之后隐身。
-    if (stealth && settings.stealthEnter && params.containsKey("not_mock_enter_effect")) {
+    if (stealth && config.stealthEnter && params.containsKey("not_mock_enter_effect")) {
       if (settings.shouldFirstEntryBeVisible(roomId)) {
         settings.markFirstEntryDone(roomId);
         debugLog("addCommonParam enter report visible (first entry of session), room=" + roomId);
       } else {
-        params.put("room_id", settings.fakeRoomId);
-        debugLog("addCommonParam not_mock_enter_effect room_id replaced -> " + settings.fakeRoomId);
+        params.put("room_id", config.fakeRoomId);
+        debugLog("addCommonParam not_mock_enter_effect room_id replaced -> " + config.fakeRoomId);
       }
     }
 
     // 房间心跳: 移除 access_key, 不计入在线人数/亲密度/高能榜
-    if (stealth && settings.anonHeartbeat && (params.containsKey("hb") || params.containsKey("heart_beat"))) {
+    if (stealth && config.anonHeartbeat && (params.containsKey("hb") || params.containsKey("heart_beat"))) {
       params.remove("access_key");
       debugLog("addCommonParam heartbeat access_key removed");
     }
@@ -98,7 +99,7 @@ public class CommonParamHook {
   // debug日志
   public void debugLog(String log) {
     if (DEBUG) {
-      mainHook.log(Log.INFO, appName, param.getPackageName() + " " + log);
+      Log.d("BiLiveStealth.Hook", param.getPackageName() + " " + log);
     }
   }
 }

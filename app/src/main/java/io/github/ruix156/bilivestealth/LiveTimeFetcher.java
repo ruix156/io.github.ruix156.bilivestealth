@@ -2,7 +2,6 @@ package io.github.ruix156.bilivestealth;
 
 import android.os.SystemClock;
 import android.util.Log;
-import android.os.SystemClock;
 
 import org.json.JSONObject;
 
@@ -12,39 +11,39 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import io.github.ruix156.bilivestealth.Settings;
-
 /**
- * 主播信息获取器:
- * 不依赖宿主 App 的 JSON 解析路径, 检测到房间号后自行请求 B 站公开接口,
- * 确定性地建立 房间 -> 主播 uid/昵称/开播时间 的映射。
- * 结果写入 Settings, 供名单按主播昵称显示与 "首进可见" 场次判定使用。
+ * 直播间开播时间获取器 (场次 key 来源):
+ * 请求 B 站公开接口 room/v1/Room/get_info 拿 live_time, 写入 Settings,
+ * 供 "首进可见" 名单的每场次判定使用。失败不缓存, 下次进房自动重试。
+ * (昵称获取已移至设置 App, 此处不再请求用户卡片接口。)
  */
-public final class AnchorInfoFetcher {
-  private static final String TAG = "AnchorInfoFetcher";
+public final class LiveTimeFetcher {
+  private static final String TAG = "BiLiveStealth.LiveTime";
   private static final ExecutorService EXEC = Executors.newSingleThreadExecutor();
   /** roomId -> 上次获取时间 (elapsedRealtime), 30 分钟内不重复请求 */
   private static final Map<Long, Long> FETCH_TIME = new ConcurrentHashMap<>();
   private static final long REFRESH_INTERVAL = 30 * 60 * 1000L;
 
   private static final String UA =
-      "Mozilla/5.0 (Linux; Android 12; Unspecified) AppleWebKit/537.36 BiliLiveStealth/1.1";
+      "Mozilla/5.0 (Linux; Android 12; Unspecified) AppleWebKit/537.36 BiliLiveStealth/1.3";
 
-  private AnchorInfoFetcher() {
+  private LiveTimeFetcher() {
   }
 
-  /** 异步获取房间的主播信息 (成功后 30 分钟内不重复请求; 失败下次进房自动重试)。 */
+  /** 异步获取房间的开播时间 (成功后 30 分钟内不重复请求; 失败下次进房自动重试)。 */
   public static void fetchAsync(long roomId, Settings settings) {
     if (roomId <= 0 || settings == null) return;
     long now = SystemClock.elapsedRealtime();
     Long last = FETCH_TIME.get(roomId);
     if (last != null && now - last < REFRESH_INTERVAL) return;
     EXEC.execute(() -> {
+      // 二次去重: 并发触发时仅首个任务真正请求
+      Long prev = FETCH_TIME.get(roomId);
+      if (prev != null && SystemClock.elapsedRealtime() - prev < REFRESH_INTERVAL) return;
       boolean ok = fetch(roomId, settings);
       if (ok) FETCH_TIME.put(roomId, SystemClock.elapsedRealtime());
     });
@@ -61,45 +60,22 @@ public final class AnchorInfoFetcher {
       }
       JSONObject data = new JSONObject(infoBody).optJSONObject("data");
       if (data == null) {
-        Log.w(TAG, "get_info no data room=" + roomId + " body=" + infoBody.substring(0, Math.min(160, infoBody.length())));
+        Log.w(TAG, "get_info no data room=" + roomId
+            + " body=" + infoBody.substring(0, Math.min(160, infoBody.length())));
         return false;
       }
-      long uid = data.optLong("uid", 0);
-      Log.i(TAG, "get_info ok room=" + roomId + " uid=" + uid
-          + " live_time=" + data.opt("live_time"));
-      if (uid <= 0) return false;
-      settings.recordAnchor(roomId, uid);
       String liveTime = data.optString("live_time", "");
       if (liveTime.isEmpty() || "0".equals(liveTime) || liveTime.startsWith("0000-00-00")) {
         long liveStart = data.optLong("live_start_time", 0);
         if (liveStart > 0) liveTime = String.valueOf(liveStart);
       }
-      if (!liveTime.isEmpty() && !"0".equals(liveTime) && !liveTime.startsWith("0000-00-00")) {
-        settings.recordLiveTime(roomId, liveTime);
+      if (liveTime.isEmpty() || "0".equals(liveTime) || liveTime.startsWith("0000-00-00")) {
+        Log.i(TAG, "get_info ok but not live yet room=" + roomId);
+        return true; // 接口正常只是未开播, 不必反复打
       }
-
-      // 主播昵称: 用户卡片接口
-      String cardBody = getRaw(
-          "https://api.bilibili.com/x/web-interface/card?mid=" + uid + "&photo=false");
-      if (cardBody == null) {
-        Log.w(TAG, "card failed (null body) mid=" + uid);
-        return false;
-      }
-      Log.i(TAG, "card body: " + cardBody.substring(0, Math.min(300, cardBody.length())));
-      JSONObject card = new JSONObject(cardBody);
-      if (card.optInt("code", -1) != 0) return false;
-      JSONObject cardData = card.optJSONObject("data");
-      JSONObject cardInfo = cardData == null ? null : cardData.optJSONObject("card");
-      String name = cardInfo == null ? "" : cardInfo.optString("name", "");
-      if (!name.isEmpty()) {
-        settings.recordRoomName(roomId, name);
-        settings.recordUname(uid, name);
-        Log.i(TAG, "nickname ok room=" + roomId + " uid=" + uid + " name=" + name);
-        return true;
-      } else {
-        Log.w(TAG, "card ok but name empty mid=" + uid);
-        return false;
-      }
+      settings.recordLiveTime(roomId, liveTime);
+      Log.i(TAG, "live_time ok room=" + roomId + " live_time=" + liveTime);
+      return true;
     } catch (Throwable t) {
       Log.w(TAG, "fetch error room=" + roomId, t);
       return false;

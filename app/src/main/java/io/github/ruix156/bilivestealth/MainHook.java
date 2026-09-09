@@ -15,7 +15,6 @@ import java.lang.reflect.Method;
 
 import io.github.ruix156.bilivestealth.hooks.CommonParamHook;
 import io.github.ruix156.bilivestealth.hooks.DanmakuHook;
-import io.github.ruix156.bilivestealth.ui.FloatingPanel;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
@@ -66,7 +65,6 @@ public class MainHook extends XposedModule {
     try {
       new CommonParamHook(this, param, addCommonParamClass, settings).hook();
       new DanmakuHook(this, param, settings).hook();
-      new FloatingPanel(this, param, settings).install();
     } catch (Throwable throwable) {
       log(Log.ERROR, appName, appName + " " + param.getPackageName() + " " + appVersionCode + " 加载异常", throwable);
       Toast.makeText(mainContext, appName + ": " + appVersionCode + " 加载异常 ", Toast.LENGTH_LONG).show();

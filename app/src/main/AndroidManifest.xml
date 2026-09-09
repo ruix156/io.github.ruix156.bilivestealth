@@ -2,9 +2,25 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+  <!-- 独立设置 App: 手动输房间号后请求 B 站公开接口补全主播昵称 -->
+  <uses-permission android:name="android.permission.INTERNET" />
+
   <application
       android:label="@string/app_name"
-      android:description="@string/xposed_description">
+      android:description="@string/xposed_description"
+      android:theme="@android:style/Theme.Material">
+
+    <!-- 声明配置可被宿主读取 (LSPosed/Vector 据此处理 SELinux) -->
+    <meta-data android:name="xposedsharedprefs" android:value="true" />
+
+    <activity
+        android:name=".ui.SettingsActivity"
+        android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
   </application>
 
 </manifest>

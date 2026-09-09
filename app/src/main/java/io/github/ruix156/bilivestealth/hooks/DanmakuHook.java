@@ -21,9 +21,9 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
  * 弹幕相关 hook:
  * 1. websocket 认证包 uid 处理 (默认保持真实登录态, 修复昵称被打码为 *** 的问题)
  * 2. 本地过滤进场消息/特效 (可选, 实验性)
- * 3. 嗅探房间的主播 uid/昵称与开播时间 (场次):
- *    - WS 消息: 弹幕 info[2]、互动消息 (单参 parseObject/parse 入口)
- *    - HTTP 响应: 房间信息等 (带 Type 的 parseObject 重载入口), 进房间即可获得主播昵称, 无需等弹幕
+ * 3. 嗅探房间的开播时间 (场次 key, 供 "首进可见" 每场次判定):
+ *    - WS 消息: 单参 parseObject/parse 入口
+ *    - HTTP 响应: 带 Type 的 parseObject 重载入口, 进房间即可获得场次, 无需等弹幕
  */
 public class DanmakuHook {
   private static final boolean DEBUG = false;
@@ -58,36 +58,7 @@ public class DanmakuHook {
     Class<?> clazz = Class.forName("com.alibaba.fastjson.JSONObject", false, param.getClassLoader());
     Method method = clazz.getDeclaredMethod("put", String.class, Object.class);
     mainHook.hook(method).intercept(chain -> {
-      try {
-        // 嗅探 uid/昵称/主播映射 (fastjson 组装对象时)
-        Object key = chain.getArg(0);
-        Object thiz = chain.getThisObject();
-        if (thiz instanceof Map) {
-          Map<?, ?> m = (Map<?, ?>) thiz;
-          if ("uid".equals(key)) {
-            long uid = parseLong(chain.getArg(1));
-            if (uid > 0) {
-              if (m.containsKey("room_id") && looksLikeRoomInfo(m)) {
-                settings.recordAnchor(parseLong(m.get("room_id")), uid);
-              }
-              Object uname = m.get("uname");
-              if (uname != null) {
-                settings.recordUname(uid, uname.toString());
-              }
-            }
-          } else if ("room_id".equals(key) && m.containsKey("uid") && looksLikeRoomInfo(m)) {
-            settings.recordAnchor(parseLong(chain.getArg(1)), parseLong(m.get("uid")));
-          } else if ("uname".equals(key) && m.containsKey("uid")) {
-            long uid = parseLong(m.get("uid"));
-            Object uname = chain.getArg(1);
-            if (uid > 0 && uname != null) {
-              settings.recordUname(uid, uname.toString());
-            }
-          }
-        }
-      } catch (Throwable ignored) {
-      }
-      if (!settings.guestDanmaku) return chain.proceed();
+      if (!settings.configSnapshot().guestDanmaku) return chain.proceed();
       if ("uid".equals(chain.getArg(0)) && ((Map<String, ?>) chain.getThisObject()).containsKey("group")) {
         Object[] args = chain.getArgs().toArray();
         args[1] = 0;
@@ -114,11 +85,10 @@ public class DanmakuHook {
           try {
             if (result instanceof Map) {
               Map<?, ?> m = (Map<?, ?>) result;
-              if (settings.filterEntryMsg) {
+              if (settings.configSnapshot().filterEntryMsg) {
                 filterEntryCmd(m);
               }
-              sniffParsed(m);
-              scanDanmuMsgUser(m);
+              scanRoomLiveTime(m);
             }
           } catch (Throwable t) {
             mainHook.log(Log.WARN, appName, param.getPackageName() + " parse hook failed", t);
@@ -130,7 +100,7 @@ public class DanmakuHook {
     }
 
     // 2) 带 Type 重载: parseObject(String, Type/Class, ...) — HTTP 响应解析成 Bean,
-    //    响应文本含 room_id 时 (房间信息等) 先自解析一遍做嗅探, 进房间立即拿到主播 uid/昵称/开播时间
+    //    响应文本含 room_id 时 (房间信息等) 先自解析一遍做嗅探, 进房间立即获得开播时间
     for (Method m : clazz.getDeclaredMethods()) {
       if (!"parseObject".equals(m.getName())) continue;
       Class<?>[] ps = m.getParameterTypes();
@@ -170,89 +140,28 @@ public class DanmakuHook {
   }
 
   /**
-   * 递归嗅探解析结果 (顶层 / data / data 的子对象 / anchor_info.base):
-   * - room_id + live_time -> 开播时间 (场次 key)
-   * - room_id + uid + 房间信息特征字段 -> 主播 uid
-   * - room_id + uname + 房间信息特征字段 -> 主播昵称
-   * - uid + uname -> 昵称映射
+   * 递归嗅探解析结果 (顶层 / data / data 的子对象) 中的 room_id + live_time -> 开播时间 (场次 key)。
    */
-  private void sniffParsed(Map<?, ?> map) {
-    scanRoomInfo(map);
-    scanUname(map);
+  private void scanRoomLiveTime(Map<?, ?> map) {
+    scanLiveTime(map);
     Object data = map.get("data");
     if (!(data instanceof Map)) return;
     Map<?, ?> d = (Map<?, ?>) data;
-    scanRoomInfo(d);
-    scanUname(d);
+    scanLiveTime(d);
     for (Object v : d.values()) {
       if (v instanceof Map) {
-        Map<?, ?> sub = (Map<?, ?>) v;
-        scanRoomInfo(sub);
-        scanUname(sub);
-        Object base = sub.get("base");
-        if (base instanceof Map) {
-          // anchor_info.base = {uid, uname, ...} 主播基本信息
-          scanUname((Map<?, ?>) base);
-        }
+        scanLiveTime((Map<?, ?>) v);
       }
     }
   }
 
-  /** 从扁平 Map 中嗅探房间信息。 */
-  private void scanRoomInfo(Map<?, ?> m) {
+  /** 从扁平 Map 中学习房间开播时间。 */
+  private void scanLiveTime(Map<?, ?> m) {
     if (!m.containsKey("room_id")) return;
-    long roomId = parseLong(m.get("room_id"));
-    if (roomId <= 0) return;
-
     Object liveTime = m.get("live_time");
     if (liveTime != null) {
-      settings.recordLiveTime(roomId, String.valueOf(liveTime));
+      settings.recordLiveTime(parseLong(m.get("room_id")), String.valueOf(liveTime));
     }
-
-    if (looksLikeRoomInfo(m)) {
-      long uid = parseLong(m.get("uid"));
-      if (uid > 0) {
-        settings.recordAnchor(roomId, uid);
-      }
-      Object uname = m.get("uname");
-      if (uname != null) {
-        settings.recordRoomName(roomId, uname.toString());
-      }
-    }
-  }
-
-  /** 从扁平 Map 中学习 uid -> 昵称。 */
-  private void scanUname(Map<?, ?> m) {
-    if (!m.containsKey("uid") || !m.containsKey("uname")) return;
-    long uid = parseLong(m.get("uid"));
-    Object uname = m.get("uname");
-    if (uid > 0 && uname != null) {
-      settings.recordUname(uid, uname.toString());
-    }
-  }
-
-  /** DANMU_MSG: info[2] = [uid, uname, ...], 学习发送者 uid -> 昵称。 */
-  private void scanDanmuMsgUser(Map<?, ?> m) {
-    if (!"DANMU_MSG".equals(m.get("cmd"))) return;
-    Object infoObj = m.get("info");
-    if (!(infoObj instanceof List)) return;
-    List<?> info = (List<?>) infoObj;
-    if (info.size() > 2 && info.get(2) instanceof List) {
-      List<?> user = (List<?>) info.get(2);
-      if (user.size() > 1) {
-        long uid = parseLong(user.get(0));
-        Object uname = user.get(1);
-        if (uid > 0 && uname != null) {
-          settings.recordUname(uid, uname.toString());
-        }
-      }
-    }
-  }
-
-  /** 是否形如房间信息 (区别于 INTERACT_WORD 等含 uid+room_id 的互动消息)。 */
-  private static boolean looksLikeRoomInfo(Map<?, ?> m) {
-    return m.containsKey("title") || m.containsKey("live_status") || m.containsKey("keyframe")
-        || m.containsKey("cover") || m.containsKey("parent_area_name");
   }
 
   private static long parseLong(Object v) {
