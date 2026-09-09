@@ -5,9 +5,12 @@ import android.content.SharedPreferences;
 
 import org.json.JSONObject;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -20,6 +23,11 @@ public class Settings {
 
   public static final String MODE_BLACK = "black";
   public static final String MODE_WHITE = "white";
+
+  // 名单标识 (用于定向删除)
+  public static final String LIST_BLACK = "black";
+  public static final String LIST_WHITE = "white";
+  public static final String LIST_FIRST = "first";
 
   private final SharedPreferences prefs;
   private final Object lock = new Object();
@@ -43,14 +51,20 @@ public class Settings {
   private volatile Set<Long> whitelist = new HashSet<>();
   // 指定直播间: 每场直播的首次入场不隐身, 之后隐身
   private volatile Set<Long> firstVisibleRooms = new HashSet<>();
-  // room -> 主播 uid (从响应中嗅探, 用于名单显示)
+  // room -> 主播 uid (从响应中嗅探)
   private final Map<Long, Long> anchorMap = new HashMap<>();
+  // uid -> 昵称 (从弹幕/互动消息中学习, 用于名单按主播昵称显示)
+  private final Map<Long, String> uidNames = new HashMap<>();
+  // room -> 主播昵称 (房间信息中直接学习, 优先级高于 uidNames)
+  private final Map<Long, String> roomNames = new HashMap<>();
   // room -> 已完成首进的场次 key (一般为开播时间 live_time)
   private final Map<Long, String> firstEntrySessions = new HashMap<>();
   // room -> 最近观测到的场次 key
   private final Map<Long, String> roomLiveTimes = new HashMap<>();
   // 本进程内已完成首进的房间 (场次 key 未知时的兜底: 场次 ≈ App 进程周期)
   private final Set<Long> sessionEntered = new HashSet<>();
+
+  private volatile long currentRoom = 0L;
 
   public Settings(Context ctx) {
     prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -70,6 +84,8 @@ public class Settings {
       whitelist = toLongSet(prefs.getStringSet("whitelist", null));
       firstVisibleRooms = toLongSet(prefs.getStringSet("firstVisibleRooms", null));
       anchorMap.putAll(toLongLongMap(prefs.getString("anchorMap", null)));
+      uidNames.putAll(toStringMap(prefs.getString("uidNames", null)));
+      roomNames.putAll(toStringMap(prefs.getString("roomNames", null)));
       firstEntrySessions.putAll(toStringMap(prefs.getString("firstEntrySessions", null)));
       roomLiveTimes.putAll(toStringMap(prefs.getString("roomLiveTimes", null)));
     }
@@ -82,9 +98,9 @@ public class Settings {
   public boolean shouldStealth(long roomId) {
     if (!master) return false;
     boolean white = MODE_WHITE.equals(listMode);
-    Set<Long> list = white ? whitelist : blacklist;
     boolean inList;
     synchronized (lock) {
+      Set<Long> list = white ? whitelist : blacklist;
       inList = roomId > 0 && list.contains(roomId);
     }
     if (white) return inList;
@@ -160,7 +176,7 @@ public class Settings {
     }
   }
 
-  // ===== 主播 uid 嗅探 (用于名单按主播显示) =====
+  // ===== 主播 uid / 昵称嗅探 (用于名单按主播昵称显示) =====
 
   public void recordAnchor(long roomId, long uid) {
     if (roomId <= 0 || uid <= 0) return;
@@ -173,10 +189,80 @@ public class Settings {
     if (changed) persistMap("anchorMap", anchorMap);
   }
 
-  public Long getAnchor(long roomId) {
+  /** 记录 uid 对应的昵称。 */
+  public void recordUname(long uid, String uname) {
+    if (uid <= 0 || uname == null) return;
+    String name = sanitizeName(uname);
+    if (name.isEmpty()) return;
+    boolean changed;
     synchronized (lock) {
-      return anchorMap.get(roomId);
+      String old = uidNames.get(uid);
+      changed = !name.equals(old);
+      if (changed) {
+        if (uidNames.size() >= 1000 && !uidNames.containsKey(uid)) return;
+        uidNames.put(uid, name);
+      }
     }
+    if (changed) persistMap("uidNames", uidNames);
+  }
+
+  /** 记录房间对应的主播昵称 (优先级最高)。 */
+  public void recordRoomName(long roomId, String uname) {
+    if (roomId <= 0 || uname == null) return;
+    String name = sanitizeName(uname);
+    if (name.isEmpty()) return;
+    boolean changed;
+    synchronized (lock) {
+      changed = !name.equals(roomNames.get(roomId));
+      if (changed) roomNames.put(roomId, name);
+    }
+    if (changed) persistMap("roomNames", roomNames);
+  }
+
+  private static String sanitizeName(String s) {
+    String name = s.trim();
+    if (name.length() > 64) name = name.substring(0, 64);
+    return name.replaceAll("[\\p{Cntrl}]", "");
+  }
+
+  /** 名单条目显示名: 优先主播昵称, 未知则显示房间号。 */
+  public String displayName(long roomId) {
+    synchronized (lock) {
+      String name = roomNames.get(roomId);
+      if (name != null) return name;
+      Long uid = anchorMap.get(roomId);
+      if (uid != null) {
+        String uname = uidNames.get(uid);
+        if (uname != null) return uname;
+      }
+    }
+    return "房间:" + roomId;
+  }
+
+  // ===== 名单只读副本 (面板列表展示用) =====
+
+  public List<Long> getBlacklistSorted() {
+    synchronized (lock) {
+      return sortedCopy(blacklist);
+    }
+  }
+
+  public List<Long> getWhitelistSorted() {
+    synchronized (lock) {
+      return sortedCopy(whitelist);
+    }
+  }
+
+  public List<Long> getFirstVisibleSorted() {
+    synchronized (lock) {
+      return sortedCopy(firstVisibleRooms);
+    }
+  }
+
+  private static List<Long> sortedCopy(Set<Long> set) {
+    List<Long> out = new ArrayList<>(set);
+    Collections.sort(out);
+    return out;
   }
 
   // ===== 基础设置读写 =====
@@ -184,8 +270,6 @@ public class Settings {
   public void setCurrentRoom(long roomId) {
     currentRoom = roomId;
   }
-
-  private volatile long currentRoom = 0L;
 
   public long getCurrentRoom() {
     return currentRoom;
@@ -226,16 +310,9 @@ public class Settings {
     prefs.edit().putString("fakeRoomId", v).apply();
   }
 
-  public boolean inList(long roomId, boolean white) {
-    synchronized (lock) {
-      Set<Long> list = white ? whitelist : blacklist;
-      return roomId > 0 && list.contains(roomId);
-    }
-  }
-
   public void addRoom(long roomId, boolean white) {
     if (roomId <= 0) return;
-    boolean changed;
+    Set<Long> after;
     synchronized (lock) {
       Set<Long> old = white ? whitelist : blacklist;
       if (old.contains(roomId)) return;
@@ -243,12 +320,27 @@ public class Settings {
       next.add(roomId);
       if (white) whitelist = next;
       else blacklist = next;
-      changed = true;
+      after = next;
     }
-    if (changed) {
-      prefs.edit().putStringSet(white ? "whitelist" : "blacklist",
-          toStrSet(white ? whitelist : blacklist)).apply();
+    prefs.edit().putStringSet(white ? "whitelist" : "blacklist", toStrSet(after)).apply();
+  }
+
+  /** 从指定名单中删除房间。which: LIST_BLACK / LIST_WHITE / LIST_FIRST。 */
+  public void removeFromList(long roomId, String which) {
+    if (roomId <= 0) return;
+    Set<Long> after;
+    synchronized (lock) {
+      Set<Long> target = LIST_WHITE.equals(which) ? whitelist
+          : LIST_FIRST.equals(which) ? firstVisibleRooms : blacklist;
+      if (!target.contains(roomId)) return;
+      Set<Long> next = new HashSet<>(target);
+      next.remove(roomId);
+      if (LIST_WHITE.equals(which)) whitelist = next;
+      else if (LIST_FIRST.equals(which)) firstVisibleRooms = next;
+      else blacklist = next;
+      after = next;
     }
+    prefs.edit().putStringSet(persistKey(which), toStrSet(after)).apply();
   }
 
   /** 从所有名单 (黑名单/白名单/首进可见) 中移除指定房间。 */
@@ -282,27 +374,13 @@ public class Settings {
     if (changed) ed.apply();
   }
 
-  /** 名单摘要: 已知主播 uid 的房间按主播显示, 否则显示房间号。 */
-  public String listSummary() {
-    synchronized (lock) {
-      return "黑名单(" + blacklist.size() + "): " + fmtRooms(blacklist)
-          + "\n白名单(" + whitelist.size() + "): " + fmtRooms(whitelist)
-          + "\n首进可见(" + firstVisibleRooms.size() + "): " + fmtRooms(firstVisibleRooms);
-    }
-  }
-
-  private String fmtRooms(Set<Long> set) {
-    if (set.isEmpty()) return "无";
-    StringBuilder sb = new StringBuilder();
-    for (Long id : set) {
-      if (sb.length() > 0) sb.append(", ");
-      Long anchor = anchorMap.get(id);
-      sb.append(anchor != null ? "主播:" + anchor : "房间:" + id);
-    }
-    return sb.toString();
-  }
-
   // ===== 序列化工具 =====
+
+  private static String persistKey(String which) {
+    if (LIST_WHITE.equals(which)) return "whitelist";
+    if (LIST_FIRST.equals(which)) return "firstVisibleRooms";
+    return "blacklist";
+  }
 
   private void persistMap(String key, Map<Long, ?> m) {
     try {

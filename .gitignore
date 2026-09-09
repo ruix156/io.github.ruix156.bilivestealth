@@ -22,3 +22,6 @@ keystore.properties
 # 系统
 .DS_Store
 Thumbs.db
+
+# Trae 项目规则 (本地私有)
+.trae/

@@ -28,6 +28,7 @@ import io.github.ruix156.bilivestealth.MainHook;
 import io.github.ruix156.bilivestealth.Settings;
 
 import java.lang.reflect.Method;
+import java.util.List;
 
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
 
@@ -37,6 +38,7 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
  * <p>通过 hook Activity.onResume, 在类名含 "liveroom" 的直播间 Activity 的
  * DecorView 上挂载一个可拖动的悬浮球; 点击悬浮球展开设置面板。
  * 面板强制使用暗色主题 (避免跟随宿主亮色主题导致白底白字)。
+ * 名单区为可视化管理列表: 按主播昵称显示, 每个条目可直接删除。
  * 所有修改立即生效并持久化 (存于 B 站应用自身 SharedPreferences)。
  */
 public class FloatingPanel {
@@ -46,6 +48,7 @@ public class FloatingPanel {
   private static final int BALL_COLOR = 0xB31B1B1B;
   private static final int PANEL_COLOR = 0xF20F0F0F;
   private static final int BTN_COLOR = 0xFF2E2E2E;
+  private static final int BTN_DEL_COLOR = 0xFF5A2A2A;
   private static final int INPUT_COLOR = 0xFF1E1E1E;
   private static final int COLOR_TEXT = 0xFFE0E0E0;
   private static final int COLOR_TEXT_DIM = 0xFF9E9E9E;
@@ -276,10 +279,11 @@ public class FloatingPanel {
     }));
     panel.addView(firstRow);
 
-    panel.addView(sectionLabel(ctx, "名单 (按主播显示, 未知则显示房间号)"));
-    TextView listSummary = text(ctx, "", 11, false);
-    listSummary.setTextColor(COLOR_TEXT_DIM);
-    panel.addView(listSummary);
+    // -- 名单管理 (可视化列表, 每条目可直接删除) --
+    panel.addView(sectionLabel(ctx, "名单管理 (按主播昵称显示, 点删除移除)"));
+    LinearLayout listContainer = new LinearLayout(ctx);
+    listContainer.setOrientation(LinearLayout.VERTICAL);
+    panel.addView(listContainer);
 
     // -- 伪装房间号 --
     panel.addView(sectionLabel(ctx, "进场上报伪装房间号"));
@@ -312,15 +316,13 @@ public class FloatingPanel {
 
     refresh = () -> {
       long room = settings.getCurrentRoom();
-      String roomStr = room > 0 ? String.valueOf(room) : "-";
-      Long anchor = room > 0 ? settings.getAnchor(room) : null;
-      String anchorStr = anchor != null ? " (主播:" + anchor + ")" : "";
+      String roomStr = room > 0 ? settings.displayName(room) + " (" + room + ")" : "-";
       roomLabel.setText("房间: " + roomStr);
-      curRoom.setText("当前房间: " + roomStr + anchorStr);
+      curRoom.setText("当前房间: " + roomStr);
       boolean black = Settings.MODE_BLACK.equals(settings.listMode);
       blackBtn.setTextColor(black ? COLOR_MODE_ON : COLOR_MODE_OFF);
       whiteBtn.setTextColor(black ? COLOR_MODE_OFF : COLOR_MODE_ON);
-      listSummary.setText(settings.listSummary());
+      rebuildLists(ctx, listContainer);
       if (!fakeInput.hasFocus() && !settings.fakeRoomId.equals(fakeInput.getText().toString())) {
         fakeInput.setText(settings.fakeRoomId);
       }
@@ -328,6 +330,49 @@ public class FloatingPanel {
 
     decor.addView(scroll);
     refresh.run();
+  }
+
+  /** 重建名单管理列表: 三个名单分区, 每个条目带删除按钮。 */
+  private void rebuildLists(Context ctx, LinearLayout container) {
+    container.removeAllViews();
+    addListSection(ctx, container, "黑名单 (隐身, 除非在此列表)", settings.getBlacklistSorted(), Settings.LIST_BLACK);
+    addListSection(ctx, container, "白名单 (仅此列表隐身)", settings.getWhitelistSorted(), Settings.LIST_WHITE);
+    addListSection(ctx, container, "首进可见 (每场首次入场不隐身)", settings.getFirstVisibleSorted(), Settings.LIST_FIRST);
+  }
+
+  /** 添加一个名单分区: 标题 + 条目列表 (显示名 + 删除按钮)。 */
+  private void addListSection(Context ctx, LinearLayout container, String title,
+      List<Long> rooms, String which) {
+    TextView header = text(ctx, title, 12, true);
+    header.setTextColor(COLOR_TEXT_DIM);
+    LinearLayout.LayoutParams headerLp = new LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    headerLp.topMargin = dp(ctx, 8);
+    header.setLayoutParams(headerLp);
+    container.addView(header);
+
+    if (rooms.isEmpty()) {
+      TextView none = text(ctx, "无", 12, false);
+      none.setTextColor(COLOR_TEXT_DIM);
+      none.setPadding(dp(ctx, 8), 0, 0, 0);
+      container.addView(none);
+      return;
+    }
+
+    for (Long roomId : rooms) {
+      LinearLayout entry = row(ctx);
+      String display = settings.displayName(roomId);
+      TextView name = text(ctx, display + " (" + roomId + ")", 12, false);
+      name.setLayoutParams(new LinearLayout.LayoutParams(
+          0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+      entry.addView(name);
+      entry.addView(btnDel(ctx, "删", v -> {
+        settings.removeFromList(roomId, which);
+        refresh.run();
+        toast(ctx, "已从名单删除 " + display);
+      }));
+      container.addView(entry);
+    }
   }
 
   /** 显示/隐藏设置面板, 显示时置于最前。 */
@@ -391,6 +436,15 @@ public class FloatingPanel {
 
   /** 深色圆角按钮 (显式背景, 不依赖宿主主题)。 */
   private static Button btn(Context ctx, String label, View.OnClickListener listener) {
+    return btn(ctx, label, BTN_COLOR, listener);
+  }
+
+  /** 红色系删除按钮。 */
+  private static Button btnDel(Context ctx, String label, View.OnClickListener listener) {
+    return btn(ctx, label, BTN_DEL_COLOR, listener);
+  }
+
+  private static Button btn(Context ctx, String label, int bgColor, View.OnClickListener listener) {
     Button b = new Button(ctx);
     b.setText(label);
     b.setAllCaps(false);
@@ -403,7 +457,7 @@ public class FloatingPanel {
     b.setPadding(dp(ctx, 10), dp(ctx, 5), dp(ctx, 10), dp(ctx, 5));
     GradientDrawable bg = new GradientDrawable();
     bg.setCornerRadius(dp(ctx, 8));
-    bg.setColor(BTN_COLOR);
+    bg.setColor(bgColor);
     b.setBackground(bg);
     b.setOnClickListener(listener);
     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
