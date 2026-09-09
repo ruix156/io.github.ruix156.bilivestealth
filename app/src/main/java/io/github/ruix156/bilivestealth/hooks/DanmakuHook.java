@@ -5,6 +5,7 @@ import static io.github.ruix156.bilivestealth.MainHook.appName;
 import android.util.Log;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Type;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -20,8 +21,9 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
  * 弹幕相关 hook:
  * 1. websocket 认证包 uid 处理 (默认保持真实登录态, 修复昵称被打码为 *** 的问题)
  * 2. 本地过滤进场消息/特效 (可选, 实验性)
- * 3. 从解析结果中嗅探房间的主播 uid/昵称与开播时间 (场次),
- *    用于名单按主播昵称显示与 "首进可见" 功能
+ * 3. 嗅探房间的主播 uid/昵称与开播时间 (场次):
+ *    - WS 消息: 弹幕 info[2]、互动消息 (单参 parseObject/parse 入口)
+ *    - HTTP 响应: 房间信息等 (带 Type 的 parseObject 重载入口), 进房间即可获得主播昵称, 无需等弹幕
  */
 public class DanmakuHook {
   private static final boolean DEBUG = false;
@@ -34,6 +36,9 @@ public class DanmakuHook {
   private final MainHook mainHook;
   private final PackageReadyParam param;
   private final Settings settings;
+
+  /** JSON.parseObject(String) 的 Method 引用, 供 HTTP 响应文本嗅探时自解析。 */
+  private volatile Method singleParseMethod;
 
   public DanmakuHook(MainHook mainHook, PackageReadyParam param, Settings settings) {
     this.mainHook = mainHook;
@@ -93,13 +98,17 @@ public class DanmakuHook {
     });
   }
 
-  // 本地过滤进场消息 + 房间/昵称信息嗅探:
-  // 拦截 fastjson 对弹幕 websocket 文本/接口响应的解析结果
+  // 解析入口 hook: 单参 (WS 消息) + 带 Type 重载 (HTTP 响应)
   private void parseHook() throws Throwable {
     Class<?> clazz = Class.forName("com.alibaba.fastjson.JSON", false, param.getClassLoader());
+
+    // 1) 单参入口: JSON.parseObject(String) / JSON.parse(String) — 弹幕 WS 消息
     for (String name : new String[]{"parseObject", "parse"}) {
       try {
         Method method = clazz.getDeclaredMethod(name, String.class);
+        if ("parseObject".equals(name)) {
+          singleParseMethod = method;
+        }
         mainHook.hook(method).intercept(chain -> {
           Object result = chain.proceed();
           try {
@@ -108,15 +117,8 @@ public class DanmakuHook {
               if (settings.filterEntryMsg) {
                 filterEntryCmd(m);
               }
-              scanRoomInfo(m);
-              scanUname(m);
+              sniffParsed(m);
               scanDanmuMsgUser(m);
-              Object data = m.get("data");
-              if (data instanceof Map) {
-                Map<?, ?> d = (Map<?, ?>) data;
-                scanRoomInfo(d);
-                scanUname(d);
-              }
             }
           } catch (Throwable t) {
             mainHook.log(Log.WARN, appName, param.getPackageName() + " parse hook failed", t);
@@ -125,6 +127,35 @@ public class DanmakuHook {
         });
       } catch (NoSuchMethodException ignored) {
       }
+    }
+
+    // 2) 带 Type 重载: parseObject(String, Type/Class, ...) — HTTP 响应解析成 Bean,
+    //    响应文本含 room_id 时 (房间信息等) 先自解析一遍做嗅探, 进房间立即拿到主播 uid/昵称/开播时间
+    for (Method m : clazz.getDeclaredMethods()) {
+      if (!"parseObject".equals(m.getName())) continue;
+      Class<?>[] ps = m.getParameterTypes();
+      if (ps.length >= 2 && ps[0] == String.class && (ps[1] == Type.class || ps[1] == Class.class)) {
+        mainHook.hook(m).intercept(chain -> {
+          try {
+            Object text = chain.getArg(0);
+            if (text instanceof String && ((String) text).contains("room_id")) {
+              sniffText((String) text);
+            }
+          } catch (Throwable ignored) {
+          }
+          return chain.proceed();
+        });
+      }
+    }
+  }
+
+  /** 对响应文本自行解析并嗅探 (借用已被 hook 的单参 parseObject, 嗅探逻辑自动复用)。 */
+  private void sniffText(String text) {
+    try {
+      Method m = singleParseMethod;
+      if (m == null) return;
+      m.invoke(null, text);
+    } catch (Throwable ignored) {
     }
   }
 
@@ -139,11 +170,35 @@ public class DanmakuHook {
   }
 
   /**
-   * 从扁平 Map 中嗅探房间信息:
-   * - room_id + live_time -> 记录开播时间 (场次 key, 用于 "首进可见" 的场次判定)
-   * - room_id + uid + 房间信息特征字段 -> 记录主播 uid
-   * - room_id + uname + 房间信息特征字段 -> 记录主播昵称
+   * 递归嗅探解析结果 (顶层 / data / data 的子对象 / anchor_info.base):
+   * - room_id + live_time -> 开播时间 (场次 key)
+   * - room_id + uid + 房间信息特征字段 -> 主播 uid
+   * - room_id + uname + 房间信息特征字段 -> 主播昵称
+   * - uid + uname -> 昵称映射
    */
+  private void sniffParsed(Map<?, ?> map) {
+    scanRoomInfo(map);
+    scanUname(map);
+    Object data = map.get("data");
+    if (!(data instanceof Map)) return;
+    Map<?, ?> d = (Map<?, ?>) data;
+    scanRoomInfo(d);
+    scanUname(d);
+    for (Object v : d.values()) {
+      if (v instanceof Map) {
+        Map<?, ?> sub = (Map<?, ?>) v;
+        scanRoomInfo(sub);
+        scanUname(sub);
+        Object base = sub.get("base");
+        if (base instanceof Map) {
+          // anchor_info.base = {uid, uname, ...} 主播基本信息
+          scanUname((Map<?, ?>) base);
+        }
+      }
+    }
+  }
+
+  /** 从扁平 Map 中嗅探房间信息。 */
   private void scanRoomInfo(Map<?, ?> m) {
     if (!m.containsKey("room_id")) return;
     long roomId = parseLong(m.get("room_id"));
@@ -166,7 +221,7 @@ public class DanmakuHook {
     }
   }
 
-  /** 从扁平 Map 中学习 uid -> 昵称 (互动消息等)。 */
+  /** 从扁平 Map 中学习 uid -> 昵称。 */
   private void scanUname(Map<?, ?> m) {
     if (!m.containsKey("uid") || !m.containsKey("uname")) return;
     long uid = parseLong(m.get("uid"));
