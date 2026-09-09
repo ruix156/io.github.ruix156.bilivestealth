@@ -111,11 +111,18 @@ keyPassword=xxx
    提交 issue, 标题 `[submission] io.github.ruix156.bilivestealth`, 机器人会自动创建模块仓库并邀请你为管理员
 5. 将 README/SUMMARY/Release 同步到自动创建的 `Xposed-Modules-Repo/io.github.ruix156.bilivestealth` 仓库即可
 
+## 发布与版本号
+
+- 每次发布的 Release **tag 名为 `版本号-版本名`** (如 `3-1.2.0`, 即 versionCode-versionName):
+  这是 LSPosed 模块仓库的收录规范, 管理器依靠 tag 中的 versionCode 判断更新; Release 标题本身是干净的 `v1.2.0`
+- APK 内部版本名为纯 `1.2.0`, 手机"应用信息"中不显示前缀
+
 ## 已知限制
 
 - 若你在某房间开通了**大航海**, 舰长列表由服务端生成, 任何客户端手段都无法隐藏
 - 匿名心跳开启期间, 该房间**不涨粉丝团亲密度** (在意可关闭"匿名心跳")
-- "过滤进场消息"与"主播 UID 学习"依赖 fastjson 解析层, B 站大版本更新后可能失效 (不影响其他功能)
+- "过滤进场消息"依赖 fastjson 解析层, B 站大版本更新后可能失效 (不影响其他功能);
+  主播昵称获取走独立公开接口, 不受其影响
 - 弹幕连接为登录态, B 站服务端理论上可见你的连接 (但直播间内无任何可见展示)
 
 ## 免责声明
