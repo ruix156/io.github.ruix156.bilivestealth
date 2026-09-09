@@ -11,6 +11,7 @@ import io.github.ruix156.bilivestealth.MainHook;
 import io.github.ruix156.bilivestealth.Settings;
 
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
+import io.github.ruix156.bilivestealth.AnchorInfoFetcher;
 
 /**
  * 拦截 B 站直播公共参数组装方法 addCommonParam(Map),
@@ -51,7 +52,11 @@ public class CommonParamHook {
 
   private void apply(Map<String, Object> params) {
     long roomId = parseRoomId(params.get("room_id"));
-    if (roomId > 0) settings.setCurrentRoom(roomId);
+    if (roomId > 0) {
+      settings.setCurrentRoom(roomId);
+      // 自主请求公开接口, 建立房间 -> 主播uid/昵称/开播时间 映射 (内部有去重节流)
+      AnchorInfoFetcher.fetchAsync(roomId, settings);
+    }
     boolean stealth = settings.shouldStealth(roomId);
 
     // 获取弹幕服务器 (getDanmuInfo): 仅 "游客弹幕连接" 开启时移除 access_key。
